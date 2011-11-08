@@ -103,19 +103,23 @@ int wmain(int argc, wchar_t **argv)
         count = min(count, size-offset);
 
 
-    // allocate row buffer
-    unsigned char *buffer = new unsigned char[width];
+
+
+    // allocate row buffer - ~1MB of buffer
+    unsigned int buffer_rows = 0x00100000 / width;
+    //unsigned int buffer_rows = 8;
+    unsigned char *buffer = new unsigned char[width*buffer_rows];
     if (!buffer)
     {
         fwprintf(stderr, L"hexdump: out of memory: width too large?");
         return 3;
     }
 
-    unsigned char *lastbuffer = 0;
+    unsigned char *lastrow = 0;
     if (skip_dups)
     {
-        lastbuffer = new unsigned char[width];
-        if (!lastbuffer)
+        lastrow = new unsigned char[width];
+        if (!lastrow)
         {
             delete [] buffer;
             fwprintf(stderr, L"hexdump: out of memory: width too large?");
@@ -126,41 +130,50 @@ int wmain(int argc, wchar_t **argv)
     // main loop
     unsigned __int64 position = offset;
     bool in_dup = false;
-    for (unsigned __int64 row = 0;; row++)
+    for (unsigned __int64 row = 0;;)
     {
         // read the line
-        unsigned int bytesToRead = (unsigned int)min(count, width);
+        unsigned int bytesToRead = (unsigned int)min(count, width*buffer_rows);
         unsigned int validBytes = readbytes(hFile, buffer, bytesToRead);
         count -= validBytes;
 
-        // skip duplicate row - but not the first or partial lines
-        if (skip_dups && row > 0 && validBytes == width && !memcmp(buffer, lastbuffer, width))
+        unsigned int valid_rows = (validBytes+width-1) / width;
+
+        for (unsigned int currow = 0; currow < valid_rows; currow++)
         {
-            if (!in_dup)
+            const unsigned char *data = &buffer[currow * width];
+            unsigned int valid_data_bytes = min(validBytes-currow*width, width);
+
+            // skip duplicate row - but not the first or partial lines
+            if (skip_dups && row > 0 && valid_data_bytes == width && !memcmp(data, lastrow, width))
             {
-                wprintf(L" *** \n");
-                if (double_space)
-                    wprintf(L"\n");
+                if (!in_dup)
+                {
+                    wprintf(L" *** \n");
+                    if (double_space)
+                        wprintf(L"\n");
+                }
+                in_dup = true;
             }
-            in_dup = true;
-        }
-        else
-        {
-            in_dup = false;
-            printline(position, buffer, validBytes);
+            else
+            {
+                in_dup = false;
+                printline(position, data, valid_data_bytes);
+            }
+
+            if (skip_dups && !in_dup)
+                memcpy(lastrow, data, width);
+            position += width;
+            row++;
         }
 
         if (validBytes < bytesToRead || count == 0)
             break;
-
-        if (skip_dups && !in_dup)
-            memcpy(lastbuffer, buffer, width);
-        position += width;
     }
 
 
-    if (lastbuffer)
-        delete [] lastbuffer;
+    if (lastrow)
+        delete [] lastrow;
     delete [] buffer;
     CloseHandle(hFile);
 
