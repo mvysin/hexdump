@@ -107,6 +107,8 @@ int wmain(int argc, wchar_t **argv)
 
     // allocate row buffer - ~1MB of buffer
     unsigned int buffer_rows = 0x00100000 / width;
+    if (buffer_rows == 0)
+        buffer_rows = 1;
     //unsigned int buffer_rows = 8;
     unsigned char *buffer = new unsigned char[width*buffer_rows];
     if (!buffer)
