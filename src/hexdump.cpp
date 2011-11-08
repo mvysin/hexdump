@@ -1,4 +1,4 @@
-// hexdump - Displays binary files in hexidecimal and ASCII format, for Windows.
+// hexdump - Displays binary files in hexadecimal and ASCII format, for Windows.
 // Copyright (c) 2011 Michael Vysin
 //
 // This program is free software: you can redistribute it and/or modify
