@@ -18,7 +18,18 @@
 #include <stdlib.h>
 #include <Windows.h>
 
+static bool double_space = false;
+static bool skip_dups = true;
+static unsigned __int64 offset = 0;
+static unsigned __int64 count = 0;
+static unsigned int width = 0x10;
+static const wchar_t *filename = 0;
+
+static bool getcmdline(int argc, wchar_t **argv);
+static void printline(unsigned __int64 offset, const unsigned char *buffer, unsigned int valid_length);
 static void pw32error(const wchar_t *msg);
+static unsigned int readbytes(HANDLE hFile, unsigned char *buffer, unsigned int size);
+
 
 int wmain(int argc, wchar_t **argv)
 {
@@ -30,85 +41,20 @@ int wmain(int argc, wchar_t **argv)
             L"This is free software distributed under the terms of the GNU General Public License\n"
             L"version 3.0 or later, and you are welcome to redistribute it under these conditions.\n\n"
 
-            L"Usage: hd [-a] [-c count] [-d] [-s offset] [-w width] file\n"
+            L"Usage: %s [options] file\n"
             L"Options:\n"
             L"    -a           : display all the data - do not skip duplicate lines\n"
             L"    -c count     : display only [count] bytes from the file\n"
             L"    -d           : double-space the output\n"
             L"    -s offset    : skip [offset] bytes, expressed as a C number literal\n"
-            L"    -w width     : use [width] bytes per row, expressed as a C number literal\n\n"
+            L"    -w width     : use [width] bytes per row, expressed as a C number literal\n\n",
+            argv[0]
         );
+        return 0;
+    }
+
+    if (!getcmdline(argc, argv))
         return 1;
-    }
-
-    // default settings
-    bool double_space = false;
-    bool skip_dups = true;
-    unsigned __int64 offset = 0;
-    unsigned __int64 count = 0;
-    unsigned int width = 0x10;
-    const wchar_t *filename = 0;
-
-    // parse command line
-    for (int i = 1; i < argc; i++)
-    {
-        const wchar_t *arg = argv[i];
-        if (arg[0] != L'-')
-        {
-            // not an option - it's the filename
-            if (filename != 0)
-            {
-                fwprintf(stderr, L"hexdump: multiple filenames specified\n");
-                return 1;
-            }
-            filename = arg;
-            continue;
-        }
-
-        // else... it's an option
-        const wchar_t *opt = &arg[1];
-        for (const wchar_t *opt = &arg[1]; *opt != 0; opt++)
-        {
-            if (*opt == L'a')
-                skip_dups = false;
-            else if (*opt == L'd')
-                double_space = true;
-            else if (*opt == L'c' || *opt == L's' || *opt == L'w')
-            {
-                if (*(opt+1) != 0 || i+1 >= argc)      // not at end of argument?
-                {
-                    fwprintf(stderr, L"hexdump: %c requires parameter\n", *opt);
-                    return 1;
-                }
-
-                // get value as C literal
-                unsigned __int64 value = _wcstoui64(argv[i+1], 0, 0);
-                if (*opt == 'c')
-                    count = value;
-                else if (*opt == 's')
-                    offset = value;
-                else if (*opt == 'w')
-                {
-                    if (value == 0)
-                    {
-                        fwprintf(stderr, L"hexdump: width cannot be zero\n");
-                        return 1;
-                    }
-                    else if (value > UINT_MAX)
-                    {
-                        fwprintf(stderr, L"hexdump: width too large\n");
-                        return 1;
-                    }
-
-                    width = (unsigned int)value;
-                }
-
-                // skip the parameter we read
-                i++;
-            }
-        }
-    }
-
 
     //
     // main loop: open the file, read it in chunks, dump it to stdout
@@ -151,21 +97,24 @@ int wmain(int argc, wchar_t **argv)
     
 
     // our count is equal to either the entire file from offset, or the passed-in value
-    count = min(count, size-offset);
+    if (count == 0)
+        count = size-offset;
+    else
+        count = min(count, size-offset);
 
 
     // allocate row buffer
-    char *buffer = new char[width];
+    unsigned char *buffer = new unsigned char[width];
     if (!buffer)
     {
         fwprintf(stderr, L"hexdump: out of memory: width too large?");
         return 3;
     }
 
-    char *lastbuffer = 0;
+    unsigned char *lastbuffer = 0;
     if (skip_dups)
     {
-        lastbuffer = new char[width];
+        lastbuffer = new unsigned char[width];
         if (!lastbuffer)
         {
             delete [] buffer;
@@ -175,31 +124,16 @@ int wmain(int argc, wchar_t **argv)
     }
 
     // main loop
-    bool print_i64 = (offset+count > UINT_MAX);
     unsigned __int64 position = offset;
     bool in_dup = false;
     for (unsigned __int64 row = 0;; row++)
     {
-        DWORD bytesRead = 0;
-        DWORD validBytes = 0;
-        while (validBytes < width)
-        {
-            if (!ReadFile(hFile, &buffer[validBytes], width, &bytesRead, 0))
-            {
-                pw32error(L"hexdump: read failed");
-                delete [] buffer;
-                if (lastbuffer)
-                    delete [] lastbuffer;
-                CloseHandle(hFile);
-                return 2;
-            }
+        // read the line
+        unsigned int bytesToRead = (unsigned int)min(count, width);
+        unsigned int validBytes = readbytes(hFile, buffer, bytesToRead);
+        count -= validBytes;
 
-            validBytes += bytesRead;
-            if (bytesRead == 0)             // EOF
-                break;
-        }
-
-        // skip duplicate row?
+        // skip duplicate row - but not the first or partial lines
         if (skip_dups && row > 0 && validBytes == width && !memcmp(buffer, lastbuffer, width))
         {
             if (!in_dup)
@@ -213,49 +147,10 @@ int wmain(int argc, wchar_t **argv)
         else
         {
             in_dup = false;
-
-            // address
-            if (print_i64)
-                wprintf(L"%016I64x: ", position);
-            else
-                wprintf(L"%08I64x: ", position);
-
-            // bytes
-            for (DWORD i = 0; i < width; i++)
-            {
-                if ((i % 8) == 0)
-                    wprintf(L" ");
-                if (i < validBytes)
-                    wprintf(L"%02x ", (unsigned int)(unsigned char)buffer[i]);
-                else
-                    wprintf(L"   ");
-            }
-
-            // ascii
-            wprintf(L" ");
-            for (DWORD i = 0; i < width; i++)
-            {
-                if (i < validBytes)
-                {
-                    char ch = buffer[i];
-                    if (ch < ' ' || ch > 0x7E)
-                        wprintf(L".");
-                    else
-                        wprintf(L"%c", ch);
-                }
-                else
-                    wprintf(L" ");
-            }
+            printline(position, buffer, validBytes);
         }
 
-        if (!skip_dups || !in_dup)
-        {
-            wprintf(L"\n");
-            if (double_space)
-                wprintf(L"\n");
-        }
-
-        if (validBytes < width)
+        if (validBytes < bytesToRead || count == 0)
             break;
 
         if (skip_dups && !in_dup)
@@ -272,6 +167,110 @@ int wmain(int argc, wchar_t **argv)
     return 0;
 }
 
+static bool getcmdline(int argc, wchar_t **argv)
+{
+    for (int i = 1; i < argc; i++)
+    {
+        const wchar_t *arg = argv[i];
+        if (arg[0] != L'-')
+        {
+            // not an option - it's the filename
+            if (filename != 0)
+            {
+                fwprintf(stderr, L"hexdump: multiple filenames specified\n");
+                return false;
+            }
+            filename = arg;
+            continue;
+        }
+
+        // else... it's an option
+        const wchar_t *opt = &arg[1];
+        for (const wchar_t *opt = &arg[1]; *opt != 0; opt++)
+        {
+            if (*opt == L'a')
+                skip_dups = false;
+            else if (*opt == L'd')
+                double_space = true;
+            else if (*opt == L'c' || *opt == L's' || *opt == L'w')
+            {
+                if (*(opt+1) != 0 || i+1 >= argc)      // not at end of argument?
+                {
+                    fwprintf(stderr, L"hexdump: %c requires parameter\n", *opt);
+                    return false;
+                }
+
+                // get value as C literal
+                unsigned __int64 value = _wcstoui64(argv[i+1], 0, 0);
+                if (*opt == 'c')
+                    count = value;
+                else if (*opt == 's')
+                    offset = value;
+                else if (*opt == 'w')
+                {
+                    if (value == 0)
+                    {
+                        fwprintf(stderr, L"hexdump: width cannot be zero\n");
+                        return false;
+                    }
+                    else if (value > UINT_MAX)
+                    {
+                        fwprintf(stderr, L"hexdump: width too large\n");
+                        return false;
+                    }
+
+                    width = (unsigned int)value;
+                }
+
+                // skip the parameter we read
+                i++;
+            }
+        }
+    }
+
+    return true;
+}
+
+static void printline(unsigned __int64 offset, const unsigned char *buffer, unsigned int valid_length)
+{
+    // address
+    if (offset+count > UINT_MAX)
+        wprintf(L"%016I64x: ", offset);
+    else
+        wprintf(L"%08I64x: ", offset);
+
+    // bytes
+    for (DWORD i = 0; i < width; i++)
+    {
+        if ((i % 8) == 0)
+            wprintf(L" ");
+        if (i < valid_length)
+            wprintf(L"%02x ", buffer[i]);
+        else
+            wprintf(L"   ");
+    }
+
+    // ascii
+    wprintf(L" ");
+    for (DWORD i = 0; i < width; i++)
+    {
+        if (i < valid_length)
+        {
+            char ch = buffer[i];
+            if (ch < ' ' || ch > 0x7E)
+                wprintf(L".");
+            else
+                wprintf(L"%c", ch);
+        }
+        else
+            wprintf(L" ");
+    }
+
+    wprintf(L"\n");
+    if (double_space)
+        wprintf(L"\n");
+}
+
 static void pw32error(const wchar_t *msg)
 {
     fwprintf(stderr, L"%s: ", msg);
@@ -286,4 +285,24 @@ static void pw32error(const wchar_t *msg)
     }
     else
         fwprintf(stderr, L"(Unknown Error)\n");
+}
+
+static unsigned int readbytes(HANDLE hFile, unsigned char *buffer, unsigned int size)
+{
+    unsigned int valid = 0;
+    while (valid < size)
+    {
+        unsigned long bytesRead = 0;
+        if (!ReadFile(hFile, &buffer[valid], size, &bytesRead, 0))
+        {
+            pw32error(L"hexdump: read failed");
+            return 0;
+        }
+
+        valid += bytesRead;
+        if (bytesRead == 0)             // EOF
+            break;
+    }
+
+    return valid;
 }
