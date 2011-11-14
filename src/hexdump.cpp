@@ -47,7 +47,13 @@ int wmain(int argc, wchar_t **argv)
             L"    -c count     : display only [count] bytes from the file\n"
             L"    -d           : double-space the output\n"
             L"    -s offset    : skip [offset] bytes, expressed as a C number literal\n"
-            L"    -w width     : use [width] bytes per row, expressed as a C number literal\n\n",
+            L"    -w width     : use [width] bytes per row, expressed as a C number literal\n\n"
+            
+            L"Notes:\n"
+            L"  - To read from STDIN, specify a filename of -\n"
+            L"  - To dump the contents of a mounted volume X:, use the filename \\\\.\\X:\n"
+            L"  - To dump the raw contents of a hard disk, use the filename \\\\.\\PHYSICALDRIVEn, where n\n"
+            L"    is a number from 0 to the number of physical drives present, minus 1",
             argv[0]
         );
         return 0;
@@ -60,30 +66,46 @@ int wmain(int argc, wchar_t **argv)
     // main loop: open the file, read it in chunks, dump it to stdout
     //
 
-    HANDLE hFile = CreateFile(filename, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE, 0, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, 0);
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    if (!wcscmp(filename, L"-"))
+    {
+        hFile = GetStdHandle(STD_INPUT_HANDLE);
+    }
+    else
+    {
+        hFile = CreateFile(filename, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE, 0, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, 0);
+    }
+
     if (hFile == INVALID_HANDLE_VALUE)
     {
         pw32error(L"hexdump: opening file failed");
         return 2;
     }
 
-    // get size
+
+    // get size - if we can - we might not be able to for STDIN or 
+    bool count_valid = (count > 0);
     LARGE_INTEGER w32size;
-    if (!GetFileSizeEx(hFile, &w32size))
+    if (GetFileSizeEx(hFile, &w32size))
     {
-        pw32error(L"hexdump: unable to determine file size");
-        return 2;
+        unsigned __int64 size = w32size.QuadPart;
+        if (offset > size)
+        {
+            fwprintf(stderr, L"hexdump: start position past end of file\n");
+            return 2;
+        }
+
+        // our count is equal to either the entire file from offset, or the passed-in value
+        if (count == 0)
+            count = size-offset;
+        else
+            count = min(count, size-offset);
+        count_valid = true;
     }
-    unsigned __int64 size = w32size.QuadPart;
 
 
     // and seek to offset
-    if (offset > size)
-    {
-        fwprintf(stderr, L"hexdump: start position past end of file\n");
-        return 2;
-    }
-    else if (offset != 0)
+    if (offset != 0)
     {
         // interpreted as ULARGE_INTEGER since FILE_BEGIN
         LARGE_INTEGER w32offset;
@@ -94,15 +116,8 @@ int wmain(int argc, wchar_t **argv)
             return 2;
         }
     }
+
     
-
-    // our count is equal to either the entire file from offset, or the passed-in value
-    if (count == 0)
-        count = size-offset;
-    else
-        count = min(count, size-offset);
-
-
 
 
     // allocate row buffer - ~1MB of buffer
@@ -135,9 +150,14 @@ int wmain(int argc, wchar_t **argv)
     for (unsigned __int64 row = 0;;)
     {
         // read the line
-        unsigned int bytesToRead = (unsigned int)min(count, width*buffer_rows);
+        unsigned int bytesToRead = width*buffer_rows;
+        if (count_valid && count < bytesToRead)             // only if we care about count
+            bytesToRead = (unsigned int)count;
+
         unsigned int validBytes = readbytes(hFile, buffer, bytesToRead);
-        count -= validBytes;
+
+        if (count_valid)
+            count -= validBytes;
 
         unsigned int valid_rows = (validBytes+width-1) / width;
 
@@ -169,7 +189,8 @@ int wmain(int argc, wchar_t **argv)
             row++;
         }
 
-        if (validBytes < bytesToRead || count == 0)
+        // reached EOF?
+        if (validBytes < bytesToRead || (count_valid && count == 0))
             break;
     }
 
@@ -187,7 +208,7 @@ static bool getcmdline(int argc, wchar_t **argv)
     for (int i = 1; i < argc; i++)
     {
         const wchar_t *arg = argv[i];
-        if (arg[0] != L'-')
+        if (arg[0] != L'-' || (arg[0] == L'-' && arg[1] == 0))          // allow single '-' to be filename
         {
             // not an option - it's the filename
             if (filename != 0)
